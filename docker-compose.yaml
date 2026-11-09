@@ -1,0 +1,48 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: goofish-hardware-sniper:local
+    container_name: goofish-hardware-sniper
+    init: true
+    ports:
+      # 绑定 WSL 内所有网卡，Windows 通过 WSL IP（或本地转发）访问。
+      - "0.0.0.0:8086:8000"
+    env_file:
+      - .env
+    environment:
+      SERVER_PORT: "8000"
+      RUNNING_IN_DOCKER: "true"
+      APP_DATABASE_FILE: /app/data/app.sqlite3
+      AI_ANALYSIS_CONCURRENCY: "1"
+      SCHEDULER_JITTER_MIN_SECONDS: "0"
+      SCHEDULER_JITTER_MAX_SECONDS: "180"
+      PRE_LLM_FILTER_ENABLED: "true"
+    extra_hosts:
+      # WSL2 原生 Docker: deploy_wsl.sh 会注入 Windows 宿主机网关 IP；
+      # 未注入时退回 Docker 的 host-gateway。
+      - "host.docker.internal:${HOST_GATEWAY_IP:-host-gateway}"
+    volumes:
+      - ./.env:/app/.env
+      - ./data:/app/data
+      - ./state:/app/state
+      - ./accounts:/app/accounts
+      - ./config.json:/app/config.json
+      - ./prompts:/app/prompts
+      - ./jsonl:/app/jsonl
+      - ./logs:/app/logs
+      - ./images:/app/images
+      - ./price_history:/app/price_history
+      - ./scripts:/app/scripts
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
