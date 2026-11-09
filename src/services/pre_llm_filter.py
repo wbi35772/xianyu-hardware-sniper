@@ -194,3 +194,32 @@ def evaluate_pre_llm_filter(
         "filter_groups": groups,
         "filter_keywords": keywords,
     }
+
+
+def evaluate_pre_detail_filter(
+    item: dict,
+    *,
+    enabled: Optional[bool] = None,
+) -> Optional[str]:
+    """详情页请求前的轻量标题黑名单检查；命中返回原因，未命中返回 None。"""
+    if enabled is None:
+        enabled = _env_bool("PRE_LLM_FILTER_ENABLED", True)
+    if not enabled:
+        return None
+
+    title = str(item.get("商品标题") or "")
+    if not title.strip():
+        return None
+
+    matched: list[str] = []
+    for group, patterns in _COMPILED_GROUPS.items():
+        for word in _match_group(title, patterns):
+            matched.append(f"{group}:{word}")
+    for pattern in _compile_extra():
+        match = pattern.search(title)
+        if match:
+            matched.append(f"自定义扩展:{match.group(0)}")
+
+    if not matched:
+        return None
+    return "、".join(dict.fromkeys(matched))

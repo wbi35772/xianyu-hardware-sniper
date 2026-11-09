@@ -52,6 +52,7 @@ from src.services.item_analysis_dispatcher import (
     ItemAnalysisDispatcher,
     ItemAnalysisJob,
 )
+from src.services.pre_llm_filter import evaluate_pre_detail_filter
 from src.services.price_history_service import (
     build_market_reference,
     load_price_snapshots,
@@ -75,6 +76,41 @@ class LoginRequiredError(Exception):
 
 FAILURE_GUARD = FailureGuard()
 EDGE_DOCKER_WARNING_PRINTED = False
+
+_MODEL_TOKEN_RE = re.compile(r"[A-Za-z]{1,6}\d{2,5}[A-Za-z]{0,4}|\d{4,5}[A-Za-z]{1,4}")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_required_title_tokens(keyword: str) -> list[str]:
+    tokens: list[str] = []
+    for match in _MODEL_TOKEN_RE.findall(keyword or ""):
+        token = match.lower()
+        if token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _normalize_title(title) -> str:
+    return re.sub(r"\s+", "", str(title or "")).lower()
+
+
+def _parse_price_value(raw) -> Optional[float]:
+    if raw is None:
+        return None
+    text = str(raw).replace("¥", "").replace("￥", "").replace(",", "").strip()
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
 
 
 def _is_login_url(url: str) -> bool:
@@ -599,6 +635,9 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
     async def _run_scrape_attempt(state_file: str, proxy_server: Optional[str]) -> int:
         processed_item_count = 0
         stop_scraping = False
+        detail_fetch_limit = _env_int("DETAIL_FETCH_LIMIT_PER_RUN", 6)
+        detail_fetch_count = 0
+        required_title_tokens = _extract_required_title_tokens(keyword)
 
         if not os.path.exists(state_file):
             raise FileNotFoundError(f"登录状态文件不存在: {state_file}")
@@ -1022,6 +1061,52 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             )
                             continue
 
+                        price_value = _parse_price_value(item_data.get("当前售价"))
+                        min_value = _parse_price_value(min_price)
+                        max_value = _parse_price_value(max_price)
+                        if price_value is not None:
+                            if min_value is not None and price_value < min_value:
+                                log_time(
+                                    f"[预筛] 价格 ¥{price_value:.0f} 低于下限 ¥{min_value:.0f}，跳过详情: {item_data['商品标题'][:20]}..."
+                                )
+                                continue
+                            if max_value is not None and price_value > max_value:
+                                log_time(
+                                    f"[预筛] 价格 ¥{price_value:.0f} 高于上限 ¥{max_value:.0f}，跳过详情: {item_data['商品标题'][:20]}..."
+                                )
+                                continue
+
+                        if required_title_tokens:
+                            normalized_title = _normalize_title(
+                                item_data.get("商品标题")
+                            )
+                            if not any(
+                                token in normalized_title
+                                for token in required_title_tokens
+                            ):
+                                log_time(
+                                    f"[预筛] 标题不含型号关键词({'/'.join(required_title_tokens)})，跳过详情: {item_data['商品标题'][:20]}..."
+                                )
+                                continue
+
+                        title_hit = evaluate_pre_detail_filter(item_data)
+                        if title_hit:
+                            log_time(
+                                f"[预筛] 标题命中黑名单({title_hit})，跳过详情: {item_data['商品标题'][:20]}..."
+                            )
+                            continue
+
+                        if (
+                            detail_fetch_limit > 0
+                            and detail_fetch_count >= detail_fetch_limit
+                        ):
+                            log_time(
+                                f"[预筛] 本轮详情请求已达上限 {detail_fetch_limit}，停止本轮剩余商品。"
+                            )
+                            stop_scraping = True
+                            break
+
+                        detail_fetch_count += 1
                         log_time(
                             f"[页内进度 {i}/{total_items_on_page}] 发现新商品，获取详情: {item_data['商品标题'][:30]}..."
                         )
@@ -1197,6 +1282,8 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
 
                         except PlaywrightTimeoutError:
                             print(f"   错误: 访问商品详情页或等待API响应超时。")
+                        except (RiskControlError, LoginRequiredError):
+                            raise
                         except Exception as e:
                             print(f"   错误: 处理商品详情时发生未知错误: {e}")
                         finally:
